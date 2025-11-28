@@ -1,0 +1,33 @@
+name: mf_design_test
+channels:
+  - conda-forge
+  - omnia
+  - defaults
+dependencies:
+  - python=3.10.4
+  - pip:
+    - gpjax==0.8.0
+    - jax==0.4.23
+    - jaxkern==0.0.5
+    - jaxlib==0.4.23
+    - jaxlinop
+    - jaxtyping
+    - jaxutils==0.0.8
+    - jinja2
+    - markupsafe
+    - ml-collections
+    - matplotlib
+    - numpy
+    - imageio
+    - optax==0.1.9
+    - pre-commit
+    - py
+    - pyfoam
+    - pytest
+    - pyyaml==6.0.3
+    - scipy==1.10.1
+    - toml==0.10.2
+    - toolz
+    - tqdm
+    - typeguard
+    - virtualenv

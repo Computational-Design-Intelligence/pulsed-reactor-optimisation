@@ -5,10 +5,29 @@ import sys
 import os
 
 from jax.nn import softplus
-from gpjax.config import add_parameter
+try:
+    from gpjax.config import add_parameter
+except ImportError:
+    # Fallback stub for old API: just return the value passed in
+    def add_parameter(*args, **kwargs):
+        """
+        Minimal stub to replace gpjax.config.add_parameter for this project.
 
-sys.path.insert(1, os.path.join(sys.path[0], ".."))
-sys.path.insert(1, "mesh_generation/classy_blocks/src/")
+        We assume the first positional argument (or 'value' kwarg) is the
+        numeric value we actually want to use.
+        """
+        if args:
+            return args[0]
+        return kwargs.get("value", None)
+
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.abspath(os.path.join(this_dir, ".."))
+classy_src = os.path.join(repo_root, "mesh_generation", "classy_blocks", "src")
+
+for p in (repo_root, classy_src):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from classy_blocks.classes.primitives import Edge
 from classy_blocks.classes.block import Block
 from classy_blocks.classes.mesh import Mesh
@@ -23,12 +42,14 @@ import distrax as dx
 import jax.numpy as jnp
 import jax.random as jr
 import matplotlib.pyplot as plt
+
 from jax import jit
-from jax.config import config
+import jax
+jax.config.update("jax_enable_x64", True)
 from jaxtyping import Array, Float
 from optax import adam
 from typing import Dict
-from jaxutils import Dataset
+#from jaxutils import Dataset
 import jaxkern as jk
 import gpjax as gpx
 
@@ -36,37 +57,93 @@ from PIL import Image
 import imageio
 from matplotlib import rc
 
+# Patch for jaxutils compatibility with newer JAX versions
+import jax
+if not hasattr(jax, 'xla'):
+    import jax._src.abstract_arrays as abstract_arrays
+    import jax._src.core as core
+    
+    class XLACompat:
+        @staticmethod
+        def abstractify(x):
+            return core.get_aval(x)
+    
+    jax.xla = XLACompat()
 
 
 key = jr.PRNGKey(10)
 # Enable Float64 for more stable matrix inversions.
-config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", True)
 
 
 def angular_distance(x, y, c):
         return jnp.abs((x - y + c) % (c * 2) - c)
 
 
-class Polar(jk.base.AbstractKernel):
-        def __init__(self) -> None:
-                super().__init__()
-                self.period: float = 2 * jnp.pi
-                self.c = self.period / 2.0  # in [0, \pi]
+# class Polar(jk.base.AbstractKernel):
+#         def __init__(self) -> None:
+#                 super().__init__()
+#                 self.period: float = 2 * jnp.pi
+#                 self.c = self.period / 2.0  # in [0, \pi]
+#                 self._pytree__static_fields = frozenset(['period', 'c'])
 
-        def __call__(
-                self, params: Dict, x: Float[Array, "1 D"], y: Float[Array, "1 D"]
-        ) -> Float[Array, "1"]:
-                tau = params["tau"]
-                t = angular_distance(x, y, self.c)
-                K = (1 + tau * t / self.c) * jnp.clip(1 - t / self.c, 0, jnp.inf) ** tau
-                return K.squeeze()
+#         def __call__(
+#                 self, params: Dict, x: Float[Array, "1 D"], y: Float[Array, "1 D"]
+#         ) -> Float[Array, "1"]:
+#                 tau = params["tau"]
+#                 t = angular_distance(x, y, self.c)
+#                 K = (1 + tau * t / self.c) * jnp.clip(1 - t / self.c, 0, jnp.inf) ** tau
+#                 return K.squeeze()
 
-        def init_params(self, key: jr.KeyArray) -> dict:
-                return {"tau": jnp.array([4.0])}
+#         def init_params(self, key: jr.KeyArray) -> dict:
+#                 return {"tau": jnp.array([4.0])}
 
-        # This is depreciated. Can be removed once JaxKern is updated.
-        def _initialise_params(self, key: jr.KeyArray) -> Dict:
-                return self.init_params(key)
+#         # This is depreciated. Can be removed once JaxKern is updated.
+#         def _initialise_params(self, key: jr.KeyArray) -> Dict:
+#                 return self.init_params(key)
+
+class PolarKernel(gpx.kernels.AbstractKernel):
+    """Polar kernel compatible with GPJax"""
+    
+    def __init__(
+        self,
+        active_dims: list = None,
+        name: str = "Polar"
+    ):
+        super().__init__(active_dims=active_dims, name=name)
+        self.period = 2 * jnp.pi
+        self.c = self.period / 2.0
+        self.tau= jnp.array([4.0])
+    
+    def __call__(
+        self,
+        x: Float[Array, "D"],
+        y: Float[Array, "D"],
+        #params: dict
+    ) -> Float[Array, ""]:
+        """Compute kernel matrix"""
+        #tau = params["kernel"]["tau"]
+        
+        # Compute pairwise angular distances
+        # x_expanded = x[:, None, :]  # [N, 1, D]
+        # y_expanded = y[None, :, :]  # [1, M, D]
+        
+        # Angular distance with periodicity
+        diff = x - y
+        t = jnp.abs((diff + self.c) % (self.c * 2) - self.c)
+        
+        # Polar kernel formula
+        K = (1 + self.tau * t / self.c) * jnp.clip(1 - t / self.c, 0, jnp.inf) ** self.tau
+        
+        return K.squeeze()  # [N, M]
+    
+#     def init_params(self, key: jr.KeyArray) -> dict:
+#         return {
+#             "kernel": {
+#                 "tau": jnp.array([4.0]),
+#                 "lengthscale": jnp.array([1.0])
+#             }
+#         }
 
 
 bij_fn = lambda x: softplus(x + jnp.array(4.0))
@@ -122,41 +199,119 @@ def rotate_xyz(x,y,z,t,t_x,c_x,c_y,c_z):
         x, y, z = rotate_z(x, y, z, 3 * np.pi / 2)
         return x,y,z
 
-def gp_interpolate_polar(X,y,n_interp):
-        # Simulate data
-        angles = jnp.linspace(0, 2 * jnp.pi, num=n_interp).reshape(-1, 1)
+# def gp_interpolate_polar(X,y,n_interp):
+#         # Simulate data
+#         angles = jnp.linspace(0, 2 * jnp.pi, num=n_interp).reshape(-1, 1)
 
-        D = Dataset(X=X, y=y)
+#         D = gpx.Dataset(X=X, y=y)
 
-        # Define polar Gaussian process 
-        PKern = Polar()
-        likelihood = gpx.Gaussian(num_datapoints=len(X))
-        circlular_posterior = gpx.Prior(kernel=PKern) * likelihood
+#         # Define polar Gaussian process 
+#         PKern = Polar()
+#         meanf = gpx.mean_functions.Zero()
+#         prior = gpx.gps.Prior(mean_function=meanf, kernel=PKern)
+#         likelihood = gpx.likelihoods.Gaussian(num_datapoints=len(X))
+#         circlular_posterior = prior * likelihood
 
-        # Initialise parameter state:
-        parameter_state = gpx.initialise(circlular_posterior, key)
-        parameter_state.params['likelihood']['obs_noise'] = 0 
-        parameter_state.trainables['likelihood']['obs_noise'] = False
+#         # Initialise parameter state:
+#         # parameter_state = gpx.initialise(circlular_posterior, key)
+#         # parameter_state.params['likelihood']['obs_noise'] = 0 
+#         # parameter_state.trainables['likelihood']['obs_noise'] = False
 
-        # Optimise GP's marginal log-likelihood using Adam
-        negative_mll = jit(circlular_posterior.marginal_log_likelihood(D, negative=True))
-        optimiser = adam(learning_rate=0.05)
+#         # # Optimise GP's marginal log-likelihood using Adam
+#         # negative_mll = jit(circlular_posterior.marginal_log_likelihood(D, negative=True))
+#         # optimiser = adam(learning_rate=0.05)
 
 
-        inference_state = gpx.fit(
-                objective=negative_mll,
-                parameter_state=parameter_state,
-                optax_optim=optimiser,
-                num_iters=1000,
-        )
+#         # inference_state = gpx.fit(
+#         #         objective=negative_mll,
+#         #         parameter_state=parameter_state,
+#         #         optax_optim=optimiser,
+#         #         num_iters=1000,
+#         # )
 
-        learned_params, training_history = inference_state.unpack()
+#         # learned_params, training_history = inference_state.unpack()
 
-        posterior_rv = likelihood(
-                learned_params, circlular_posterior(learned_params, D)(angles)
-        )
-        mu = posterior_rv.mean()
-        return angles, mu 
+#         # posterior_rv = likelihood(
+#         #         learned_params, circlular_posterior(learned_params, D)(angles)
+#         # )
+#         # mu = posterior_rv.mean()
+#         objective = gpx.objectives.ConjugateMLL(negative=True)
+#         opt = adam(learning_rate=0.05)
+        
+#         posterior_opt, history = gpx.fit(
+#                 model=circlular_posterior,
+#                 objective=objective,
+#                 train_data=D,
+#                 optim=opt,
+#                 num_iters=1000,
+#                 key=key,
+#         )
+
+#         # Make predictions
+#         latent_dist = posterior_opt.predict(angles, train_data=D)
+#         predictive_dist = posterior_opt.likelihood(latent_dist)
+#         mu = predictive_dist.mean()
+#         return angles, mu
+
+def gp_interpolate_polar(X, y, n_interp):
+    """GP interpolation with polar kernel"""
+    # Simulate data
+    angles = jnp.linspace(0, 2 * jnp.pi, num=n_interp).reshape(-1, 1)
+    
+    D = gpx.Dataset(X=X, y=y)
+    
+    # Define polar Gaussian process with GPJax-compatible kernel
+    kernel = PolarKernel()
+    meanf = gpx.mean_functions.Zero()
+    prior = gpx.gps.Prior(mean_function=meanf, kernel=kernel)
+    likelihood = gpx.likelihoods.Gaussian(num_datapoints=len(X))
+    posterior = prior * likelihood
+    
+    # Initialize parameters
+#     params = kernel.init_params(key)
+#     params["likelihood"] = {"obs_stddev": jnp.array([0.01])}
+    
+    # Fit the model
+    objective = gpx.objectives.ConjugateMLL(negative=True)
+    opt = adam(learning_rate=0.05)
+    
+    posterior_opt, history = gpx.fit(
+        model=posterior,
+        objective=objective,
+        train_data=D,
+        optim=opt,
+        num_iters=1000,
+        key=key,
+    )
+    
+    # Make predictions
+    latent_dist = posterior_opt.predict(angles, train_data=D)
+    predictive_dist = posterior_opt.likelihood(latent_dist)
+    mu = predictive_dist.mean()
+    
+    return angles, mu
+
+# def gp_interpolate_polar(X, y, n_interp):
+#     """Interpolate polar data using scipy instead of GP to avoid compatibility issues"""
+#     from scipy.interpolate import interp1d
+    
+#     # Flatten inputs
+#     angles_in = X.flatten()
+#     radius_in = y.flatten()
+    
+#     # Add periodic boundary conditions (wrap around)
+#     angles_extended = np.concatenate([angles_in - 2*np.pi, angles_in, angles_in + 2*np.pi])
+#     radius_extended = np.concatenate([radius_in, radius_in, radius_in])
+    
+#     # Create interpolator
+#     interp_func = interp1d(angles_extended, radius_extended, kind='cubic')
+    
+#     # Generate output points
+#     angles_out = np.linspace(0, 2 * np.pi, n_interp, endpoint=False).reshape(-1, 1)
+#     radius_out = interp_func(angles_out.flatten()).reshape(-1, 1)
+    
+#     return angles_out, radius_out
+
 
 def create_center_circle(d,r):
         # from a centre, radius, and z rotation,

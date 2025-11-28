@@ -110,8 +110,14 @@ def mfbo(f, data_path, x_bounds, z_bounds,time_budget,gamma=1.5, beta=2.5, p_c=2
 
         start_time = time.time()
         # reading data from file format
+    
         data = read_json(data_path)
+        print(f"Number of data points: {len(data['data'])}")
+        if len(data['data']) > 0:
+            print(f"First data point x keys: {data['data'][0]['x'].keys()}")
+            print(f"Number of x values: {len(data['data'][0]['x'])}")
         inputs, outputs, cost = format_data(data)
+        print(f"inputs shape: {inputs.shape}")
         # normalising all data
         j_mean, j_std = mean_std(inputs)
 
